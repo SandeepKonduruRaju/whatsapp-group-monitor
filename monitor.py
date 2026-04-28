@@ -1,12 +1,12 @@
 """
 WhatsApp Accommodation Monitor
 ================================
-Scans WhatsApp groups every 3 hours for keyword mentions
-and sends you a WhatsApp message alert when found.
+Scans WhatsApp groups for keyword mentions and sends you a WhatsApp
+alert message when a new match is found.
 
 Usage:
-    python monitor.py            # Run continuously (every SCAN_INTERVAL_SECONDS)
-    python monitor.py --once     # Run a single scan and exit
+    python monitor.py           # Run continuously (every SCAN_INTERVAL_SECONDS)
+    python monitor.py --once    # Single scan then exit
 """
 
 import asyncio
@@ -18,6 +18,7 @@ import unicodedata
 from datetime import datetime
 from pathlib import Path
 
+# Force UTF-8 output on Windows so emoji don't crash the console.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -27,11 +28,12 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 
 from config import (
     GROUPS_TO_MONITOR,
+    HEADLESS,
     KEYWORDS,
+    LOG_FILE,
     MESSAGES_TO_SCAN,
     SCAN_INTERVAL_SECONDS,
     SESSION_DIR,
-    LOG_FILE,
 )
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -48,20 +50,27 @@ log = logging.getLogger(__name__)
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def load_seen() -> set:
+def load_seen() -> set[str]:
+    """Load previously alerted message IDs to prevent duplicate alerts."""
     if not Path(LOG_FILE).exists():
         return set()
-    with open(LOG_FILE) as f:
+    with open(LOG_FILE, encoding="utf-8") as f:
         data = json.load(f)
     return set(data.get("seen", []))
 
 
-def save_seen(seen: set):
-    with open(LOG_FILE, "w") as f:
-        json.dump({"seen": list(seen)[-5000:], "updated": datetime.now().isoformat()}, f, indent=2)
+def save_seen(seen: set[str]) -> None:
+    """Persist seen message IDs, capped at 5000 entries."""
+    with open(LOG_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {"seen": list(seen)[-5000:], "updated": datetime.now().isoformat()},
+            f,
+            indent=2,
+        )
 
 
 def contains_keyword(text: str) -> str | None:
+    """Return the first matching keyword found in text, or None."""
     lower = text.lower()
     for kw in KEYWORDS:
         if kw.lower() in lower:
@@ -70,6 +79,7 @@ def contains_keyword(text: str) -> str | None:
 
 
 def make_uid(group: str, sender: str, text: str) -> str:
+    """Stable dedup key: group + sender + first 60 chars of message."""
     return f"{group}|{sender}|{text[:60]}"
 
 
@@ -80,11 +90,11 @@ def normalise(s: str) -> str:
 # ── WhatsApp browser logic ─────────────────────────────────────────────────────
 
 async def open_whatsapp(playwright):
-    """Launch Chromium with a persistent session so QR is only needed once."""
-    Path(SESSION_DIR).mkdir(exist_ok=True)
+    """Launch Chromium with a persistent session so QR scan is only needed once."""
+    Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
     browser = await playwright.chromium.launch_persistent_context(
         SESSION_DIR,
-        headless=False,
+        headless=HEADLESS,
         args=["--no-sandbox"],
         viewport={"width": 1280, "height": 900},
     )
@@ -93,7 +103,7 @@ async def open_whatsapp(playwright):
 
 
 async def wait_for_load(page) -> bool:
-    """Navigate to WhatsApp Web; wait for chat list or QR code."""
+    """Navigate to WhatsApp Web and wait until the chat list is visible."""
     log.info("Loading WhatsApp Web...")
     await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
 
@@ -103,7 +113,7 @@ async def wait_for_load(page) -> bool:
             timeout=60_000,
         )
     except PlaywrightTimeout:
-        log.warning("WhatsApp Web took too long to load.")
+        log.warning("WhatsApp Web took too long to load — check your connection.")
         return False
 
     if await page.query_selector('canvas[aria-label="Scan me!"]'):
@@ -112,45 +122,49 @@ async def wait_for_load(page) -> bool:
         log.info("=" * 60)
         try:
             await page.wait_for_selector('div[data-testid="chat-list"]', timeout=90_000)
-            log.info("QR scanned — session saved.")
+            log.info("QR scanned successfully — session saved.")
         except PlaywrightTimeout:
             log.error("QR scan timed out. Restart and try again.")
             return False
 
-    await page.wait_for_timeout(3000)
+    await page.wait_for_timeout(3_000)
     log.info("WhatsApp Web loaded.")
     return True
 
 
 async def open_group(page, group_name: str) -> bool:
-    """Find the group in the chat list and open it."""
+    """Find a group by name in the chat list and open its conversation."""
     norm_target = normalise(group_name)
 
     async def scan_rows() -> bool:
         rows = await page.query_selector_all('#pane-side div[role="row"]')
         log.info(f"  Scanning {len(rows)} row(s) for '{group_name}'")
         for row in rows:
-            title_el = await row.query_selector('[data-testid="cell-frame-title"] span[dir="auto"]')
+            title_el = await row.query_selector(
+                '[data-testid="cell-frame-title"] span[dir="auto"]'
+            )
             if not title_el:
                 continue
-            # title attribute has full text including emoji (inner_text drops <img> emoji)
+            # WhatsApp renders emoji as <img> tags — inner_text() drops them.
+            # The title attribute contains the full plain-text name with emoji.
             title = await title_el.get_attribute("title") or await title_el.inner_text()
             if norm_target in normalise(title):
                 log.info(f"  Matched: '{title.strip()}'")
                 await row.click()
                 await page.wait_for_selector(
-                    'div[data-testid="conversation-panel-messages"]', timeout=10_000
+                    'div[data-testid="conversation-panel-messages"]',
+                    timeout=10_000,
                 )
                 log.info("  Conversation panel loaded.")
                 return True
         return False
 
     try:
-        # First pass: group is usually visible in the default chat list
+        # Most active groups are visible in the default list without searching.
         if await scan_rows():
             return True
 
-        # Fallback: trigger search with Ctrl+F
+        # Fallback: open WhatsApp's search with Ctrl+F.
         log.info("  Not in visible list — trying Ctrl+F search...")
         await page.keyboard.press("Control+f")
         await page.wait_for_timeout(800)
@@ -162,7 +176,7 @@ async def open_group(page, group_name: str) -> bool:
         )
         await search_input.click()
         await page.keyboard.type(group_name, delay=50)
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(2_500)
 
         if await scan_rows():
             return True
@@ -172,18 +186,19 @@ async def open_group(page, group_name: str) -> bool:
         return False
 
     except PlaywrightTimeout:
-        log.warning(f"  Timeout finding group: '{group_name}'")
+        log.warning(f"  Timeout while finding group: '{group_name}'")
         return False
 
 
 async def get_messages(page, n: int) -> list[dict]:
-    """Scrape the last N text messages from the open chat."""
-    messages = []
+    """Scrape the last N text messages from the currently open chat."""
+    messages: list[dict] = []
     try:
         panel = await page.query_selector('div[data-testid="conversation-panel-messages"]')
         if panel:
+            # Scroll near the bottom to ensure recent messages are rendered.
             await panel.evaluate("el => el.scrollTop = el.scrollHeight - 3000")
-            await page.wait_for_timeout(1500)
+            await page.wait_for_timeout(1_500)
 
         bubbles = []
         for sel in [
@@ -205,7 +220,7 @@ async def get_messages(page, n: int) -> list[dict]:
                 sender_el = await bubble.query_selector('span[data-testid="author"]')
                 sender = (await sender_el.inner_text()).strip() if sender_el else "You"
 
-                text = None
+                text: str | None = None
                 for sel in ['div.copyable-text', 'span[data-testid="selectable-text"]']:
                     el = await bubble.query_selector(sel)
                     if el:
@@ -224,15 +239,16 @@ async def get_messages(page, n: int) -> list[dict]:
     return messages
 
 
-async def send_alert(page, alert_text: str):
-    """Send the alert to your own WhatsApp chat."""
+async def send_alert(page, alert_text: str) -> None:
+    """Send the alert message to your own WhatsApp chat."""
     log.info("Sending alert to self...")
     try:
+        # 'message-yourself-row' is always pinned at the top of the chat list.
         self_row = await page.wait_for_selector(
             'div[data-testid="message-yourself-row"]', timeout=10_000
         )
         await self_row.click()
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(1_500)
 
         input_box = await page.wait_for_selector(
             'div[data-testid="conversation-compose-box-input"]', timeout=10_000
@@ -240,16 +256,17 @@ async def send_alert(page, alert_text: str):
         await input_box.click()
         await page.wait_for_timeout(300)
 
-        # Newlines in WhatsApp require Shift+Enter; plain Enter sends the message
-        for i, line in enumerate(alert_text.split("\n")):
+        # WhatsApp sends on plain Enter; use Shift+Enter for newlines within the message.
+        lines = alert_text.split("\n")
+        for i, line in enumerate(lines):
             if line:
                 await page.keyboard.type(line, delay=20)
-            if i < alert_text.count("\n"):
+            if i < len(lines) - 1:
                 await page.keyboard.press("Shift+Enter")
 
         await page.wait_for_timeout(500)
         await page.keyboard.press("Enter")
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1_000)
         log.info("  Alert sent!")
 
     except Exception as e:
@@ -268,20 +285,20 @@ def build_alert(hits: list[dict]) -> str:
     ]
     for i, hit in enumerate(hits, 1):
         lines += [
-            f"{i}. {hit['group']}",
+            f"{i}. [{hit['group']}]",
             f"From: {hit['sender']}",
             f"Message: {hit['text'][:200]}",
             "",
         ]
-    lines.append("Reply quickly — accommodation goes fast!")
+    lines.append("Act fast — accommodation goes quickly!")
     return "\n".join(lines)
 
 
-# ── Main scan ─────────────────────────────────────────────────────────────────
+# ── Main scan loop ─────────────────────────────────────────────────────────────
 
-async def run_scan():
+async def run_scan() -> None:
     seen = load_seen()
-    new_hits = []
+    new_hits: list[dict] = []
 
     async with async_playwright() as pw:
         browser, page = await open_whatsapp(pw)
@@ -318,19 +335,20 @@ async def run_scan():
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-async def main():
+async def main() -> None:
     if "--once" in sys.argv:
-        log.info("Single scan...")
+        log.info("Running single scan...")
         await run_scan()
         log.info("Done.")
         return
 
-    log.info(f"Monitor started — scanning every {SCAN_INTERVAL_SECONDS // 3600}h. Ctrl+C to stop.")
+    interval_h = SCAN_INTERVAL_SECONDS // 3600
+    log.info(f"Monitor started — scanning every {interval_h}h. Press Ctrl+C to stop.")
     while True:
         try:
             await run_scan()
         except Exception as e:
-            log.error(f"Scan error: {e}", exc_info=True)
+            log.error(f"Scan failed: {e}", exc_info=True)
         next_run = datetime.fromtimestamp(time.time() + SCAN_INTERVAL_SECONDS)
         log.info(f"Next scan at {next_run.strftime('%H:%M:%S')}. Sleeping...\n")
         await asyncio.sleep(SCAN_INTERVAL_SECONDS)
@@ -340,4 +358,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\nMonitor stopped.")
