@@ -1,21 +1,26 @@
 """
 WhatsApp Accommodation Monitor
 ================================
-Scans WhatsApp groups for keyword mentions and sends you a WhatsApp
-alert message when a new match is found.
+Scans WhatsApp groups for keyword mentions every 2 hours (6am–11pm) and sends
+alerts via Telegram (primary) and/or Email (backup).
 
 Usage:
-    python monitor.py           # Run continuously (every SCAN_INTERVAL_SECONDS)
+    python monitor.py           # Run continuously within active hours
     python monitor.py --once    # Single scan then exit
 """
 
 import asyncio
 import json
 import logging
+import smtplib
+import ssl
 import sys
 import time
 import unicodedata
-from datetime import datetime
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta
+from email.mime.text import MIMEText
 from pathlib import Path
 
 # Force UTF-8 output on Windows so emoji don't crash the console.
@@ -27,13 +32,21 @@ if hasattr(sys.stderr, "reconfigure"):
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 from config import (
+    EMAIL_ENABLED,
+    EMAIL_FROM,
+    EMAIL_PASSWORD,
+    EMAIL_TO,
     GROUPS_TO_MONITOR,
     HEADLESS,
     KEYWORDS,
     LOG_FILE,
     MESSAGES_TO_SCAN,
+    SCAN_END_HOUR,
     SCAN_INTERVAL_SECONDS,
+    SCAN_START_HOUR,
     SESSION_DIR,
+    TELEGRAM_BOT_TOKEN,
+    TELEGRAM_CHAT_ID,
 )
 
 # ── Logging ────────────────────────────────────────────────────────────────────
@@ -87,6 +100,85 @@ def normalise(s: str) -> str:
     return unicodedata.normalize("NFC", s).strip().lower()
 
 
+# ── Alert: Telegram ────────────────────────────────────────────────────────────
+
+def send_telegram_alert(text: str) -> bool:
+    """Send alert via Telegram Bot API. Returns True on success."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured — skipping.")
+        return False
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        payload = urllib.parse.urlencode({
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+        }).encode()
+        req = urllib.request.Request(url, data=payload)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            success = resp.status == 200
+            if success:
+                log.info("  Telegram alert sent.")
+            return success
+    except Exception as e:
+        log.error(f"  Telegram alert failed: {e}")
+        return False
+
+
+# ── Alert: Email ───────────────────────────────────────────────────────────────
+
+def send_email_alert(subject: str, body: str) -> bool:
+    """Send alert via Gmail SMTP. Returns True on success."""
+    if not EMAIL_ENABLED or not EMAIL_FROM or not EMAIL_PASSWORD:
+        return False
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = EMAIL_FROM
+        msg["To"] = EMAIL_TO
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        log.info("  Email alert sent.")
+        return True
+    except Exception as e:
+        log.error(f"  Email alert failed: {e}")
+        return False
+
+
+# ── Alert: build message ───────────────────────────────────────────────────────
+
+def build_alert(hits: list[dict]) -> str:
+    now = datetime.now().strftime("%d %b %Y, %H:%M")
+    kw_list = ", ".join(dict.fromkeys(k.lower() for k in KEYWORDS))
+    lines = [
+        f"Accommodation Alert — {now}",
+        f"Found {len(hits)} new mention(s) of: {kw_list}",
+        "",
+    ]
+    for i, hit in enumerate(hits, 1):
+        lines += [
+            f"{i}. [{hit['group']}]",
+            f"From: {hit['sender']}",
+            f"Message: {hit['text'][:300]}",
+            "",
+        ]
+    lines.append("Act fast — accommodation goes quickly!")
+    return "\n".join(lines)
+
+
+def dispatch_alerts(hits: list[dict]) -> None:
+    """Send alerts via all configured channels."""
+    alert_text = build_alert(hits)
+    subject = f"Accommodation Alert — {len(hits)} new mention(s)"
+
+    telegram_ok = send_telegram_alert(alert_text)
+    email_ok = send_email_alert(subject, alert_text)
+
+    if not telegram_ok and not email_ok:
+        log.warning("All alert channels failed or unconfigured.")
+
+
 # ── WhatsApp browser logic ─────────────────────────────────────────────────────
 
 async def open_whatsapp(playwright):
@@ -110,7 +202,7 @@ async def wait_for_load(page) -> bool:
     try:
         await page.wait_for_selector(
             'div[data-testid="chat-list"], canvas[aria-label="Scan me!"]',
-            timeout=60_000,
+            timeout=90_000,
         )
     except PlaywrightTimeout:
         log.warning("WhatsApp Web took too long to load — check your connection.")
@@ -138,34 +230,41 @@ async def open_group(page, group_name: str) -> bool:
 
     async def scan_rows() -> bool:
         rows = await page.query_selector_all('#pane-side div[role="row"]')
-        log.info(f"  Scanning {len(rows)} row(s) for '{group_name}'")
+        exact_match = None
+        partial_match = None
+
         for row in rows:
             title_el = await row.query_selector(
                 '[data-testid="cell-frame-title"] span[dir="auto"]'
             )
             if not title_el:
                 continue
-            # WhatsApp renders emoji as <img> tags — inner_text() drops them.
-            # The title attribute contains the full plain-text name with emoji.
+            # WhatsApp renders emoji as <img> — title attribute has the full plain-text name.
             title = await title_el.get_attribute("title") or await title_el.inner_text()
-            if norm_target in normalise(title):
-                log.info(f"  Matched: '{title.strip()}'")
-                await row.click()
-                await page.wait_for_selector(
-                    'div[data-testid="conversation-panel-messages"]',
-                    timeout=10_000,
-                )
-                log.info("  Conversation panel loaded.")
-                return True
+            norm_title = normalise(title)
+            if norm_title == norm_target:
+                exact_match = (row, title)
+                break  # exact match wins immediately
+            if norm_target in norm_title and partial_match is None:
+                partial_match = (row, title)
+
+        best = exact_match or partial_match
+        if best:
+            row, title = best
+            log.info(f"  Matched: '{title.strip()}'")
+            await row.click()
+            await page.wait_for_selector(
+                'div[data-testid="conversation-panel-messages"]',
+                timeout=20_000,
+            )
+            return True
         return False
 
     try:
-        # Most active groups are visible in the default list without searching.
         if await scan_rows():
             return True
 
-        # Fallback: open WhatsApp's search with Ctrl+F.
-        log.info("  Not in visible list — trying Ctrl+F search...")
+        # Fallback: open search with Ctrl+F
         await page.keyboard.press("Control+f")
         await page.wait_for_timeout(800)
         search_input = await page.wait_for_selector(
@@ -196,7 +295,6 @@ async def get_messages(page, n: int) -> list[dict]:
     try:
         panel = await page.query_selector('div[data-testid="conversation-panel-messages"]')
         if panel:
-            # Scroll near the bottom to ensure recent messages are rendered.
             await panel.evaluate("el => el.scrollTop = el.scrollHeight - 3000")
             await page.wait_for_timeout(1_500)
 
@@ -208,11 +306,10 @@ async def get_messages(page, n: int) -> list[dict]:
         ]:
             bubbles = await page.query_selector_all(sel)
             if bubbles:
-                log.info(f"  {len(bubbles)} message bubble(s) found.")
                 break
 
         if not bubbles:
-            log.warning("  No message bubbles found in DOM.")
+            log.warning("  No message bubbles found.")
             return messages
 
         for bubble in bubbles[-n:]:
@@ -239,61 +336,6 @@ async def get_messages(page, n: int) -> list[dict]:
     return messages
 
 
-async def send_alert(page, alert_text: str) -> None:
-    """Send the alert message to your own WhatsApp chat."""
-    log.info("Sending alert to self...")
-    try:
-        # 'message-yourself-row' is always pinned at the top of the chat list.
-        self_row = await page.wait_for_selector(
-            'div[data-testid="message-yourself-row"]', timeout=10_000
-        )
-        await self_row.click()
-        await page.wait_for_timeout(1_500)
-
-        input_box = await page.wait_for_selector(
-            'div[data-testid="conversation-compose-box-input"]', timeout=10_000
-        )
-        await input_box.click()
-        await page.wait_for_timeout(300)
-
-        # WhatsApp sends on plain Enter; use Shift+Enter for newlines within the message.
-        lines = alert_text.split("\n")
-        for i, line in enumerate(lines):
-            if line:
-                await page.keyboard.type(line, delay=20)
-            if i < len(lines) - 1:
-                await page.keyboard.press("Shift+Enter")
-
-        await page.wait_for_timeout(500)
-        await page.keyboard.press("Enter")
-        await page.wait_for_timeout(1_000)
-        log.info("  Alert sent!")
-
-    except Exception as e:
-        log.error(f"  Failed to send alert: {e}")
-
-
-# ── Alert formatting ───────────────────────────────────────────────────────────
-
-def build_alert(hits: list[dict]) -> str:
-    now = datetime.now().strftime("%d %b %Y, %H:%M")
-    kw_list = ", ".join(dict.fromkeys(k.lower() for k in KEYWORDS))
-    lines = [
-        f"Accommodation Alert — {now}",
-        f"Found {len(hits)} new mention(s) of: {kw_list}",
-        "",
-    ]
-    for i, hit in enumerate(hits, 1):
-        lines += [
-            f"{i}. [{hit['group']}]",
-            f"From: {hit['sender']}",
-            f"Message: {hit['text'][:200]}",
-            "",
-        ]
-    lines.append("Act fast — accommodation goes quickly!")
-    return "\n".join(lines)
-
-
 # ── Main scan loop ─────────────────────────────────────────────────────────────
 
 async def run_scan() -> None:
@@ -309,10 +351,11 @@ async def run_scan() -> None:
         for group in GROUPS_TO_MONITOR:
             log.info(f"Scanning: {group}")
             if not await open_group(page, group):
+                log.warning(f"  Skipping — group not found.")
                 continue
 
             messages = await get_messages(page, MESSAGES_TO_SCAN)
-            log.info(f"  {len(messages)} message(s) to check.")
+            log.info(f"  {len(messages)} message(s) checked.")
 
             for msg in messages:
                 kw = contains_keyword(msg["text"])
@@ -320,20 +363,35 @@ async def run_scan() -> None:
                     continue
                 uid = make_uid(group, msg["sender"], msg["text"])
                 if uid not in seen:
-                    log.info(f"  MATCH from {msg['sender']}: {msg['text'][:80]}...")
+                    log.info(f"  MATCH [{kw}] from {msg['sender']}: {msg['text'][:80]}...")
                     new_hits.append({**msg, "group": group, "keyword": kw, "uid": uid})
                     seen.add(uid)
 
-        if new_hits:
-            await send_alert(page, build_alert(new_hits))
-        else:
-            log.info(f"No new mentions of: {', '.join(KEYWORDS)}")
-
-        save_seen(seen)
         await browser.close()
+
+    if new_hits:
+        log.info(f"{len(new_hits)} new hit(s) — sending alerts...")
+        dispatch_alerts(new_hits)
+    else:
+        log.info(f"No new mentions of: {', '.join(KEYWORDS)}")
+
+    save_seen(seen)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
+
+def _next_wake(after: datetime) -> datetime:
+    """Return the next scan time, skipping outside the active window."""
+    candidate = after + timedelta(seconds=SCAN_INTERVAL_SECONDS)
+    if SCAN_START_HOUR <= candidate.hour < SCAN_END_HOUR:
+        return candidate
+    # Candidate falls outside window — wake at 6am
+    if candidate.hour >= SCAN_END_HOUR:
+        base = candidate + timedelta(days=1)
+    else:
+        base = candidate
+    return base.replace(hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0)
+
 
 async def main() -> None:
     if "--once" in sys.argv:
@@ -342,16 +400,32 @@ async def main() -> None:
         log.info("Done.")
         return
 
-    interval_h = SCAN_INTERVAL_SECONDS // 3600
-    log.info(f"Monitor started — scanning every {interval_h}h. Press Ctrl+C to stop.")
+    interval_h = SCAN_INTERVAL_SECONDS / 3600
+    log.info(
+        f"Monitor started — scanning every {interval_h:.0f}h "
+        f"between {SCAN_START_HOUR:02d}:00–{SCAN_END_HOUR:02d}:00. "
+        "Press Ctrl+C to stop."
+    )
     while True:
-        try:
-            await run_scan()
-        except Exception as e:
-            log.error(f"Scan failed: {e}", exc_info=True)
-        next_run = datetime.fromtimestamp(time.time() + SCAN_INTERVAL_SECONDS)
-        log.info(f"Next scan at {next_run.strftime('%H:%M:%S')}. Sleeping...\n")
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        now = datetime.now()
+        if SCAN_START_HOUR <= now.hour < SCAN_END_HOUR:
+            try:
+                await run_scan()
+            except Exception as e:
+                log.error(f"Scan failed: {e}", exc_info=True)
+            wake = _next_wake(datetime.now())
+        else:
+            # Outside active window — sleep until 6am
+            if now.hour >= SCAN_END_HOUR:
+                wake = (now + timedelta(days=1)).replace(
+                    hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0
+                )
+            else:
+                wake = now.replace(hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0)
+
+        sleep_secs = max((wake - datetime.now()).total_seconds(), 0)
+        log.info(f"Next scan at {wake.strftime('%d %b %H:%M')}. Sleeping...\n")
+        await asyncio.sleep(sleep_secs)
 
 
 if __name__ == "__main__":

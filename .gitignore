@@ -16,7 +16,7 @@ __pycache__/
 venv/
 *.egg-info/
 
-# Environment
+# Environment / secrets
 .env
 
 # IDE

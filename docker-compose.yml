@@ -1,0 +1,10 @@
+services:
+  monitor:
+    build: .
+    env_file: .env
+    volumes:
+      # Persist your WhatsApp login session across container restarts
+      - ./whatsapp_session:/app/whatsapp_session
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
