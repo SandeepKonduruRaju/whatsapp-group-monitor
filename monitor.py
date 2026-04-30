@@ -4,6 +4,14 @@ WhatsApp Accommodation Monitor
 Scans WhatsApp groups for keyword mentions every 2 hours (6am–11pm) and sends
 alerts via Telegram (primary) and/or Email (backup).
 
+Telegram bot commands (send to the bot):
+    /status         → last scan time, hits, schedule
+    /keywords       → list active keywords
+    /addkeyword X   → add keyword X without editing code
+    /removekeyword X→ remove keyword X
+    /scan           → trigger an immediate scan right now
+    /help           → show all commands
+
 Usage:
     python monitor.py           # Run continuously within active hours
     python monitor.py --once    # Single scan then exit
@@ -15,7 +23,6 @@ import logging
 import smtplib
 import ssl
 import sys
-import time
 import unicodedata
 import urllib.parse
 import urllib.request
@@ -60,39 +67,49 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# ── Runtime state (shared between scan loop and command listener) ──────────────
+_state: dict = {
+    "last_scan_at": None,       # datetime of last completed scan
+    "total_hits": 0,            # total keyword matches found this session
+    "keywords": list(KEYWORDS), # mutable — updated by /addkeyword and /removekeyword
+    "tg_offset": 0,             # Telegram getUpdates offset (dedup)
+}
+_scan_event = asyncio.Event()   # set by /scan command to wake the scan loop early
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def load_seen() -> set[str]:
-    """Load previously alerted message IDs to prevent duplicate alerts."""
     if not Path(LOG_FILE).exists():
         return set()
     with open(LOG_FILE, encoding="utf-8") as f:
         data = json.load(f)
+    _state["total_hits"] = data.get("total_hits", 0)
     return set(data.get("seen", []))
 
 
 def save_seen(seen: set[str]) -> None:
-    """Persist seen message IDs, capped at 5000 entries."""
     with open(LOG_FILE, "w", encoding="utf-8") as f:
         json.dump(
-            {"seen": list(seen)[-5000:], "updated": datetime.now().isoformat()},
+            {
+                "seen": list(seen)[-5000:],
+                "total_hits": _state["total_hits"],
+                "updated": datetime.now().isoformat(),
+            },
             f,
             indent=2,
         )
 
 
 def contains_keyword(text: str) -> str | None:
-    """Return the first matching keyword found in text, or None."""
     lower = text.lower()
-    for kw in KEYWORDS:
+    for kw in _state["keywords"]:
         if kw.lower() in lower:
             return kw
     return None
 
 
 def make_uid(group: str, sender: str, text: str) -> str:
-    """Stable dedup key: group + sender + first 60 chars of message."""
     return f"{group}|{sender}|{text[:60]}"
 
 
@@ -100,34 +117,46 @@ def normalise(s: str) -> str:
     return unicodedata.normalize("NFC", s).strip().lower()
 
 
-# ── Alert: Telegram ────────────────────────────────────────────────────────────
+# ── Telegram: send ─────────────────────────────────────────────────────────────
+
+def _tg_post(method: str, payload: dict) -> dict:
+    """Synchronous Telegram API POST (runs in thread pool from async code)."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    data = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(url, data=data)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+
+def _tg_get(method: str, params: dict) -> dict:
+    """Synchronous Telegram API GET."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    qs = urllib.parse.urlencode(params)
+    with urllib.request.urlopen(f"{url}?{qs}", timeout=35) as resp:
+        return json.loads(resp.read())
+
 
 def send_telegram_alert(text: str) -> bool:
-    """Send alert via Telegram Bot API. Returns True on success."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured — skipping.")
         return False
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = urllib.parse.urlencode({
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-        }).encode()
-        req = urllib.request.Request(url, data=payload)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            success = resp.status == 200
-            if success:
-                log.info("  Telegram alert sent.")
-            return success
+        _tg_post("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": text})
+        log.info("  Telegram alert sent.")
+        return True
     except Exception as e:
         log.error(f"  Telegram alert failed: {e}")
         return False
 
 
+async def tg_reply(text: str) -> None:
+    """Send a Telegram message from async context without blocking the event loop."""
+    await asyncio.to_thread(send_telegram_alert, text)
+
+
 # ── Alert: Email ───────────────────────────────────────────────────────────────
 
 def send_email_alert(subject: str, body: str) -> bool:
-    """Send alert via Gmail SMTP. Returns True on success."""
     if not EMAIL_ENABLED or not EMAIL_FROM or not EMAIL_PASSWORD:
         return False
     try:
@@ -146,11 +175,11 @@ def send_email_alert(subject: str, body: str) -> bool:
         return False
 
 
-# ── Alert: build message ───────────────────────────────────────────────────────
+# ── Alert: build and dispatch ──────────────────────────────────────────────────
 
 def build_alert(hits: list[dict]) -> str:
     now = datetime.now().strftime("%d %b %Y, %H:%M")
-    kw_list = ", ".join(dict.fromkeys(k.lower() for k in KEYWORDS))
+    kw_list = ", ".join(dict.fromkeys(k.lower() for k in _state["keywords"]))
     lines = [
         f"Accommodation Alert — {now}",
         f"Found {len(hits)} new mention(s) of: {kw_list}",
@@ -167,22 +196,117 @@ def build_alert(hits: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def dispatch_alerts(hits: list[dict]) -> None:
-    """Send alerts via all configured channels."""
+async def dispatch_alerts(hits: list[dict]) -> None:
     alert_text = build_alert(hits)
     subject = f"Accommodation Alert — {len(hits)} new mention(s)"
-
-    telegram_ok = send_telegram_alert(alert_text)
-    email_ok = send_email_alert(subject, alert_text)
-
+    telegram_ok = await asyncio.to_thread(send_telegram_alert, alert_text)
+    email_ok = await asyncio.to_thread(send_email_alert, subject, alert_text)
     if not telegram_ok and not email_ok:
         log.warning("All alert channels failed or unconfigured.")
+
+
+# ── Telegram: bot commands ─────────────────────────────────────────────────────
+
+async def handle_command(text: str) -> str:
+    parts = text.strip().split(maxsplit=1)
+    cmd = parts[0].lower().split("@")[0]   # strip @botname suffix if present
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd == "/status":
+        if _state["last_scan_at"]:
+            delta = datetime.now() - _state["last_scan_at"]
+            mins = int(delta.total_seconds() // 60)
+            when = f"{mins} min ago" if mins < 60 else _state["last_scan_at"].strftime("%d %b %H:%M")
+        else:
+            when = "not yet (since restart)"
+        return (
+            f"WhatsApp Monitor — Status\n"
+            f"{'─' * 28}\n"
+            f"Last scan:   {when}\n"
+            f"Total hits:  {_state['total_hits']}\n"
+            f"Groups:      {len(GROUPS_TO_MONITOR)}\n"
+            f"Keywords:    {', '.join(_state['keywords'])}\n"
+            f"Schedule:    every {SCAN_INTERVAL_SECONDS//3600}h, "
+            f"{SCAN_START_HOUR:02d}:00–{SCAN_END_HOUR:02d}:00"
+        )
+
+    elif cmd == "/keywords":
+        kws = "\n".join(f"  • {k}" for k in _state["keywords"])
+        return f"Active keywords ({len(_state['keywords'])}):\n{kws}"
+
+    elif cmd == "/addkeyword":
+        if not arg:
+            return "Usage: /addkeyword <word>\nExample: /addkeyword griffith"
+        kw = arg.lower()
+        if kw in [k.lower() for k in _state["keywords"]]:
+            return f"'{kw}' is already being monitored."
+        _state["keywords"].append(kw)
+        return f"Added '{kw}'.\nNow monitoring: {', '.join(_state['keywords'])}"
+
+    elif cmd == "/removekeyword":
+        if not arg:
+            return "Usage: /removekeyword <word>"
+        kw = arg.lower()
+        before = len(_state["keywords"])
+        _state["keywords"] = [k for k in _state["keywords"] if k.lower() != kw]
+        if len(_state["keywords"]) < before:
+            return f"Removed '{kw}'.\nNow monitoring: {', '.join(_state['keywords'])}"
+        return f"'{kw}' not found in keywords."
+
+    elif cmd == "/scan":
+        _scan_event.set()
+        return "Triggering an immediate scan now. Results coming shortly..."
+
+    elif cmd == "/help":
+        return (
+            "WhatsApp Monitor — Commands\n"
+            "─────────────────────────────\n"
+            "/status           — last scan, hits, schedule\n"
+            "/keywords         — list active keywords\n"
+            "/addkeyword X     — start watching keyword X\n"
+            "/removekeyword X  — stop watching keyword X\n"
+            "/scan             — trigger an immediate scan\n"
+            "/help             — show this message"
+        )
+
+    return f"Unknown command: {cmd}\nSend /help for available commands."
+
+
+async def command_listener() -> None:
+    """Poll Telegram every 2 seconds for bot commands from the configured chat."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured — command listener disabled.")
+        return
+
+    log.info("Telegram command listener started. Send /help to the bot.")
+    while True:
+        try:
+            data = await asyncio.to_thread(
+                _tg_get,
+                "getUpdates",
+                {
+                    "offset": _state["tg_offset"],
+                    "timeout": 30,
+                    "allowed_updates": "message",
+                },
+            )
+            for update in data.get("result", []):
+                _state["tg_offset"] = update["update_id"] + 1
+                msg = update.get("message", {})
+                text = msg.get("text", "")
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                if text.startswith("/") and chat_id == str(TELEGRAM_CHAT_ID):
+                    log.info(f"Command received: {text}")
+                    reply = await handle_command(text)
+                    await tg_reply(reply)
+        except Exception as e:
+            log.warning(f"Command poll error: {e}")
+            await asyncio.sleep(5)
 
 
 # ── WhatsApp browser logic ─────────────────────────────────────────────────────
 
 async def open_whatsapp(playwright):
-    """Launch Chromium with a persistent session so QR scan is only needed once."""
     Path(SESSION_DIR).mkdir(parents=True, exist_ok=True)
     browser = await playwright.chromium.launch_persistent_context(
         SESSION_DIR,
@@ -195,10 +319,8 @@ async def open_whatsapp(playwright):
 
 
 async def wait_for_load(page) -> bool:
-    """Navigate to WhatsApp Web and wait until the chat list is visible."""
     log.info("Loading WhatsApp Web...")
     await page.goto("https://web.whatsapp.com", wait_until="domcontentloaded")
-
     try:
         await page.wait_for_selector(
             'div[data-testid="chat-list"], canvas[aria-label="Scan me!"]',
@@ -225,26 +347,23 @@ async def wait_for_load(page) -> bool:
 
 
 async def open_group(page, group_name: str) -> bool:
-    """Find a group by name in the chat list and open its conversation."""
     norm_target = normalise(group_name)
 
     async def scan_rows() -> bool:
         rows = await page.query_selector_all('#pane-side div[role="row"]')
         exact_match = None
         partial_match = None
-
         for row in rows:
             title_el = await row.query_selector(
                 '[data-testid="cell-frame-title"] span[dir="auto"]'
             )
             if not title_el:
                 continue
-            # WhatsApp renders emoji as <img> — title attribute has the full plain-text name.
             title = await title_el.get_attribute("title") or await title_el.inner_text()
             norm_title = normalise(title)
             if norm_title == norm_target:
                 exact_match = (row, title)
-                break  # exact match wins immediately
+                break
             if norm_target in norm_title and partial_match is None:
                 partial_match = (row, title)
 
@@ -263,8 +382,6 @@ async def open_group(page, group_name: str) -> bool:
     try:
         if await scan_rows():
             return True
-
-        # Fallback: open search with Ctrl+F
         await page.keyboard.press("Control+f")
         await page.wait_for_timeout(800)
         search_input = await page.wait_for_selector(
@@ -276,21 +393,17 @@ async def open_group(page, group_name: str) -> bool:
         await search_input.click()
         await page.keyboard.type(group_name, delay=50)
         await page.wait_for_timeout(2_500)
-
         if await scan_rows():
             return True
-
         log.warning(f"  Group not found: '{group_name}'")
         await page.keyboard.press("Escape")
         return False
-
     except PlaywrightTimeout:
         log.warning(f"  Timeout while finding group: '{group_name}'")
         return False
 
 
 async def get_messages(page, n: int) -> list[dict]:
-    """Scrape the last N text messages from the currently open chat."""
     messages: list[dict] = []
     try:
         panel = await page.query_selector('div[data-testid="conversation-panel-messages"]')
@@ -316,7 +429,6 @@ async def get_messages(page, n: int) -> list[dict]:
             try:
                 sender_el = await bubble.query_selector('span[data-testid="author"]')
                 sender = (await sender_el.inner_text()).strip() if sender_el else "You"
-
                 text: str | None = None
                 for sel in ['div.copyable-text', 'span[data-testid="selectable-text"]']:
                     el = await bubble.query_selector(sel)
@@ -324,19 +436,16 @@ async def get_messages(page, n: int) -> list[dict]:
                         text = (await el.inner_text()).strip()
                         if text:
                             break
-
                 if text:
                     messages.append({"sender": sender, "text": text})
             except Exception:
                 continue
-
     except Exception as e:
         log.warning(f"  Error scraping messages: {e}")
-
     return messages
 
 
-# ── Main scan loop ─────────────────────────────────────────────────────────────
+# ── Main scan logic ────────────────────────────────────────────────────────────
 
 async def run_scan() -> None:
     seen = load_seen()
@@ -351,12 +460,10 @@ async def run_scan() -> None:
         for group in GROUPS_TO_MONITOR:
             log.info(f"Scanning: {group}")
             if not await open_group(page, group):
-                log.warning(f"  Skipping — group not found.")
+                log.warning("  Skipping — group not found.")
                 continue
-
             messages = await get_messages(page, MESSAGES_TO_SCAN)
             log.info(f"  {len(messages)} message(s) checked.")
-
             for msg in messages:
                 kw = contains_keyword(msg["text"])
                 if not kw:
@@ -369,11 +476,14 @@ async def run_scan() -> None:
 
         await browser.close()
 
+    _state["last_scan_at"] = datetime.now()
+
     if new_hits:
+        _state["total_hits"] += len(new_hits)
         log.info(f"{len(new_hits)} new hit(s) — sending alerts...")
-        dispatch_alerts(new_hits)
+        await dispatch_alerts(new_hits)
     else:
-        log.info(f"No new mentions of: {', '.join(KEYWORDS)}")
+        log.info(f"No new mentions of: {', '.join(_state['keywords'])}")
 
     save_seen(seen)
 
@@ -381,11 +491,9 @@ async def run_scan() -> None:
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def _next_wake(after: datetime) -> datetime:
-    """Return the next scan time, skipping outside the active window."""
     candidate = after + timedelta(seconds=SCAN_INTERVAL_SECONDS)
     if SCAN_START_HOUR <= candidate.hour < SCAN_END_HOUR:
         return candidate
-    # Candidate falls outside window — wake at 6am
     if candidate.hour >= SCAN_END_HOUR:
         base = candidate + timedelta(days=1)
     else:
@@ -393,29 +501,22 @@ def _next_wake(after: datetime) -> datetime:
     return base.replace(hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0)
 
 
-async def main() -> None:
-    if "--once" in sys.argv:
-        log.info("Running single scan...")
-        await run_scan()
-        log.info("Done.")
-        return
-
+async def scan_loop() -> None:
     interval_h = SCAN_INTERVAL_SECONDS / 3600
     log.info(
-        f"Monitor started — scanning every {interval_h:.0f}h "
-        f"between {SCAN_START_HOUR:02d}:00–{SCAN_END_HOUR:02d}:00. "
-        "Press Ctrl+C to stop."
+        f"Scan loop started — every {interval_h:.0f}h "
+        f"between {SCAN_START_HOUR:02d}:00–{SCAN_END_HOUR:02d}:00."
     )
     while True:
         now = datetime.now()
-        if SCAN_START_HOUR <= now.hour < SCAN_END_HOUR:
+        if SCAN_START_HOUR <= now.hour < SCAN_END_HOUR or _scan_event.is_set():
+            _scan_event.clear()
             try:
                 await run_scan()
             except Exception as e:
                 log.error(f"Scan failed: {e}", exc_info=True)
             wake = _next_wake(datetime.now())
         else:
-            # Outside active window — sleep until 6am
             if now.hour >= SCAN_END_HOUR:
                 wake = (now + timedelta(days=1)).replace(
                     hour=SCAN_START_HOUR, minute=0, second=0, microsecond=0
@@ -425,7 +526,26 @@ async def main() -> None:
 
         sleep_secs = max((wake - datetime.now()).total_seconds(), 0)
         log.info(f"Next scan at {wake.strftime('%d %b %H:%M')}. Sleeping...\n")
-        await asyncio.sleep(sleep_secs)
+        try:
+            # Wake early if /scan command is received
+            await asyncio.wait_for(_scan_event.wait(), timeout=sleep_secs)
+            log.info("Immediate scan requested via /scan.")
+        except asyncio.TimeoutError:
+            pass
+
+
+async def main() -> None:
+    if "--once" in sys.argv:
+        log.info("Running single scan...")
+        await run_scan()
+        log.info("Done.")
+        return
+
+    log.info("Monitor started. Send /help to the Telegram bot for commands.")
+    await asyncio.gather(
+        scan_loop(),
+        command_listener(),
+    )
 
 
 if __name__ == "__main__":
