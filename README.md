@@ -25,21 +25,21 @@ Dublin's rental market is brutally competitive. Affordable accommodation — esp
 
 ```mermaid
 flowchart TD
-    A([▶ Start Monitor]) --> B{Inside active window?\n6am – 11pm}
-    B -- No --> C[😴 Sleep until 6am]
+    A([Start Monitor]) --> B{Active window 6am-11pm?}
+    B -->|No| C[Sleep until 6am]
     C --> B
-    B -- Yes --> D[🌐 Open WhatsApp Web\nin Chromium browser]
-    D --> E[🔁 For each of 15 groups]
-    E --> F[📜 Scroll & scrape\nlast 50 messages]
-    F --> G{Keyword found?\nvantage / central park\noccu east}
-    G -- No --> H{More groups?}
-    G -- Yes --> I{Already alerted?}
-    I -- Yes --> H
-    I -- No --> J[📱 Send Telegram Alert]
-    J --> K[💾 Save to dedup log]
+    B -->|Yes| D[Open WhatsApp Web in Chromium]
+    D --> E[For each of 15 groups]
+    E --> F[Scroll and scrape last 50 messages]
+    F --> G{Keyword found?}
+    G -->|No| H{More groups?}
+    G -->|Yes| I{Already alerted?}
+    I -->|Yes| H
+    I -->|No| J[Send Telegram Alert]
+    J --> K[Save to dedup log]
     K --> H
-    H -- Yes --> E
-    H -- No --> L[😴 Sleep 2 hours]
+    H -->|Yes| E
+    H -->|No| L[Sleep 2 hours]
     L --> B
 ```
 
@@ -175,19 +175,33 @@ docker compose logs -f
 
 ---
 
+## Testing
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+Tests cover keyword matching, deduplication logic, normalisation, and schedule calculation — all without needing a browser or Telegram connection.
+
+---
+
 ## Project Structure
 
 ```
 .
-├── monitor.py           # Core automation — browser, scraping, alerts
-├── config.py            # All settings (groups, keywords, schedule)
-├── requirements.txt     # Python dependencies (just Playwright)
-├── Dockerfile           # Container definition
-├── docker-compose.yml   # One-command deployment
-├── .env                 # Telegram credentials — NOT in git
-├── .env.example         # Template showing required variables
-├── whatsapp_session/    # Saved browser session — NOT in git
-└── monitor_log.json     # Seen message IDs (dedup) — NOT in git
+├── monitor.py              # Core automation — browser, scraping, alerts
+├── config.py               # All settings (groups, keywords, schedule)
+├── requirements.txt        # Runtime dependencies (Playwright)
+├── requirements-dev.txt    # Dev dependencies (pytest)
+├── tests/
+│   └── test_monitor.py     # Unit tests
+├── Dockerfile              # Container definition
+├── docker-compose.yml      # One-command deployment
+├── .env                    # Telegram credentials — NOT in git
+├── .env.example            # Template showing required variables
+├── whatsapp_session/       # Saved browser session — NOT in git
+└── monitor_log.json        # Seen message IDs (dedup) — NOT in git
 ```
 
 ---
